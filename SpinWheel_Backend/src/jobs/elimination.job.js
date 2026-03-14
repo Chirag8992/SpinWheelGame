@@ -1,13 +1,7 @@
-const Bull           = require('bull');
+const Bull             = require('bull');
 const { getPool, sql } = require('../config/db');
 const { acquireLock, releaseLock } = require('../config/redis');
 
-// ─────────────────────────────────────────────────────────────
-// QUEUES
-// Two separate Bull queues:
-//   1. autoStartQueue  → fires once at auto_start_at time
-//   2. eliminationQueue → fires every 7 seconds during game
-// ─────────────────────────────────────────────────────────────
 const redisOpts = {
   redis: {
     host: process.env.REDIS_HOST || '127.0.0.1',
@@ -15,52 +9,32 @@ const redisOpts = {
   }
 };
 
-const autoStartQueue   = new Bull('auto-start-queue',   redisOpts);
-const eliminationQueue = new Bull('elimination-queue',  redisOpts);
+const autoStartQueue   = new Bull('auto-start-queue',  redisOpts);
+const eliminationQueue = new Bull('elimination-queue', redisOpts);
 
-// ── Will be set from app.js after io is ready ────────────────
 let _io = null;
 function setIo(io) { _io = io; }
 
-// ─────────────────────────────────────────────────────────────
-// SCHEDULE AUTO-START  (called when wheel is created)
-// Fires once at auto_start_at time
-// ─────────────────────────────────────────────────────────────
+// ── Schedule auto-start ───────────────────────────────────────
 async function scheduleAutoStart(wheelId, autoStartAt) {
   const delay = new Date(autoStartAt).getTime() - Date.now();
-  if (delay <= 0) return; // already past time
-
+  if (delay <= 0) return;
   await autoStartQueue.add(
     { wheelId },
-    {
-      delay,
-      jobId:    `autostart:${wheelId}`,   // named so we can cancel it later
-      attempts: 1
-    }
+    { delay, jobId: `autostart:${wheelId}`, attempts: 1 }
   );
-
-  console.log(`⏰ Auto-start scheduled for wheel #${wheelId} in ${Math.round(delay / 1000)}s`);
+  console.log(`⏰ Auto-start scheduled for wheel #${wheelId} in ${Math.round(delay/1000)}s`);
 }
 
-// ─────────────────────────────────────────────────────────────
-// CANCEL AUTO-START  (called when admin manually starts/aborts)
-// ─────────────────────────────────────────────────────────────
+// ── Cancel auto-start ─────────────────────────────────────────
 async function cancelAutoStart(wheelId) {
   const job = await autoStartQueue.getJob(`autostart:${wheelId}`);
-  if (job) {
-    await job.remove();
-    console.log(`🚫 Auto-start cancelled for wheel #${wheelId}`);
-  }
+  if (job) { await job.remove(); console.log(`🚫 Auto-start cancelled for wheel #${wheelId}`); }
 }
 
-// ─────────────────────────────────────────────────────────────
-// START ELIMINATION  (called when wheel starts)
-// Adds elimination jobs every 7 seconds
-// ─────────────────────────────────────────────────────────────
+// ── Queue elimination jobs ────────────────────────────────────
 async function startElimination(wheelId, eliminationSequence) {
-  const INTERVAL_MS = 7000; // 7 seconds per elimination
-
-  // Schedule one job per elimination in sequence
+  const INTERVAL_MS = 7000;
   for (let i = 0; i < eliminationSequence.length; i++) {
     await eliminationQueue.add(
       {
@@ -72,63 +46,46 @@ async function startElimination(wheelId, eliminationSequence) {
       {
         delay:    (i + 1) * INTERVAL_MS,
         jobId:    `elim:${wheelId}:${i + 1}`,
-        attempts: 3,          // retry up to 3 times on failure
+        attempts: 3,
         backoff:  { type: 'fixed', delay: 1000 }
       }
     );
   }
-
-  console.log(`⚡ Elimination sequence started for wheel #${wheelId} — ${eliminationSequence.length} eliminations queued`);
+  console.log(`⚡ Elimination sequence started for wheel #${wheelId} — ${eliminationSequence.length} jobs queued`);
 }
 
-// ─────────────────────────────────────────────────────────────
-// AUTO-START QUEUE PROCESSOR
-// ─────────────────────────────────────────────────────────────
+// ── Auto-start processor ──────────────────────────────────────
 autoStartQueue.process(async (job) => {
   const { wheelId } = job.data;
   console.log(`⏰ Auto-start firing for wheel #${wheelId}`);
-
-  // Lazy load to avoid circular dependency
   const wheelService = require('../modules/wheel/wheel.service');
-
   try {
     const result = await wheelService.autoStartOrAbort(wheelId);
-
     if (result.action === 'aborted') {
       console.log(`❌ Wheel #${wheelId} aborted — only ${result.participantCount} players`);
-      if (_io) {
-        _io.to(`wheel_${wheelId}`).emit('game_aborted', {
-          wheelId,
-          message: `Not enough players (${result.participantCount}/3). Game aborted and entry fees refunded.`
-        });
-      }
+      if (_io) _io.to(`wheel_${wheelId}`).emit('game_aborted', {
+        wheelId,
+        message: `Not enough players (${result.participantCount}/3). Entry fees refunded.`
+      });
     }
-
     if (result.action === 'started') {
       console.log(`✅ Wheel #${wheelId} auto-started with ${result.participantCount} players`);
-      if (_io) {
-        _io.to(`wheel_${wheelId}`).emit('wheel_started', {
-          wheelId,
-          participantCount: result.participantCount,
-          message:          'Wheel auto-started! Eliminations begin now.'
-        });
-      }
-      // Kick off eliminations
+      if (_io) _io.to(`wheel_${wheelId}`).emit('wheel_started', {
+        wheelId,
+        participantCount: result.participantCount,
+        message: 'Wheel auto-started! Eliminations begin now.'
+      });
       await startElimination(wheelId, result.eliminationSequence);
     }
-
   } catch (err) {
     console.error(`Auto-start error for wheel #${wheelId}:`, err.message);
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// ELIMINATION QUEUE PROCESSOR
-// ─────────────────────────────────────────────────────────────
+// ── Elimination processor ─────────────────────────────────────
 eliminationQueue.process(async (job) => {
   const { wheelId, userId, eliminationOrder, isLast } = job.data;
 
-  // ── Distributed lock: prevent duplicate eliminations ──────
   const lockKey = `lock:elim:${wheelId}:${eliminationOrder}`;
   const locked  = await acquireLock(lockKey, 10000);
   if (!locked) {
@@ -139,21 +96,21 @@ eliminationQueue.process(async (job) => {
   try {
     const pool = await getPool();
 
-    // ── Verify wheel is still active ──────────────────────
+    // Verify wheel still active
     const wheelResult = await pool.request()
       .input('id', sql.Int, wheelId)
       .query(`SELECT status FROM spin_wheels WHERE id = @id`);
 
     if (!wheelResult.recordset[0] || wheelResult.recordset[0].status !== 'active') {
-      console.log(`Wheel #${wheelId} no longer active, skipping elimination`);
+      console.log(`Wheel #${wheelId} no longer active, skipping elimination #${eliminationOrder}`);
       return;
     }
 
-    // ── Eliminate the player ───────────────────────────────
+    // Eliminate the player
     await pool.request()
-      .input('wheel_id',         sql.Int,      wheelId)
-      .input('user_id',          sql.Int,      userId)
-      .input('elimination_order',sql.Int,      eliminationOrder)
+      .input('wheel_id',          sql.Int, wheelId)
+      .input('user_id',           sql.Int, userId)
+      .input('elimination_order', sql.Int, eliminationOrder)
       .query(`
         UPDATE spin_wheel_participants
         SET status            = 'eliminated',
@@ -162,7 +119,7 @@ eliminationQueue.process(async (job) => {
         WHERE spin_wheel_id = @wheel_id AND user_id = @user_id
       `);
 
-    // ── Log the elimination ────────────────────────────────
+    // Count remaining
     const remainingResult = await pool.request()
       .input('wheel_id', sql.Int, wheelId)
       .query(`
@@ -170,31 +127,28 @@ eliminationQueue.process(async (job) => {
         FROM spin_wheel_participants
         WHERE spin_wheel_id = @wheel_id AND status = 'active'
       `);
-
     const remaining = remainingResult.recordset[0].remaining;
 
+    // Log elimination
     await pool.request()
-      .input('wheel_id',         sql.Int, wheelId)
-      .input('user_id',          sql.Int, userId)
-      .input('elimination_order',sql.Int, eliminationOrder)
-      .input('remaining',        sql.Int, remaining)
+      .input('wheel_id',          sql.Int, wheelId)
+      .input('user_id',           sql.Int, userId)
+      .input('elimination_order', sql.Int, eliminationOrder)
+      .input('remaining',         sql.Int, remaining)
       .query(`
-        INSERT INTO elimination_log
-          (spin_wheel_id, eliminated_user_id, elimination_order, remaining_players)
-        VALUES
-          (@wheel_id, @user_id, @elimination_order, @remaining)
+        INSERT INTO elimination_log (spin_wheel_id, eliminated_user_id, elimination_order, remaining_players)
+        VALUES (@wheel_id, @user_id, @elimination_order, @remaining)
       `);
 
-    // ── Get username for socket event ──────────────────────
+    // Get username
     const userResult = await pool.request()
       .input('id', sql.Int, userId)
       .query(`SELECT username FROM users WHERE id = @id`);
-
     const username = userResult.recordset[0]?.username || 'Unknown';
 
     console.log(`💀 Eliminated: ${username} from wheel #${wheelId} (${remaining} remaining)`);
 
-    // ── Emit to all clients in the room ───────────────────
+    // Emit player_eliminated
     if (_io) {
       _io.to(`wheel_${wheelId}`).emit('player_eliminated', {
         wheelId,
@@ -205,23 +159,58 @@ eliminationQueue.process(async (job) => {
       });
     }
 
-    // ── If this was the last elimination → find winner ─────
+    // ── Last elimination → declare winner ─────────────────
     if (isLast) {
-      await declareWinner(wheelId);
+      console.log(`🏆 Last elimination done for wheel #${wheelId}, declaring winner...`);
+      try {
+        await declareWinner(wheelId);
+      } catch (winnerErr) {
+        // Log the REAL error so you can see it in backend console
+        console.error(`❌ declareWinner FAILED for wheel #${wheelId}:`, winnerErr.message, winnerErr.stack);
+
+        // Still emit game_over so frontend is not stuck forever
+        if (_io) {
+          // Try to at least find who the remaining player is
+          try {
+            const pool2 = await getPool();
+            const fallback = await pool2.request()
+              .input('wheel_id', sql.Int, wheelId)
+              .query(`
+                SELECT u.username
+                FROM spin_wheel_participants p
+                INNER JOIN users u ON u.id = p.user_id
+                WHERE p.spin_wheel_id = @wheel_id AND p.status = 'active'
+              `);
+            const fallbackWinner = fallback.recordset[0]?.username || 'Unknown';
+            _io.to(`wheel_${wheelId}`).emit('game_over', {
+              wheelId,
+              winnerUserId:   null,
+              winnerUsername: fallbackWinner,
+              amountWon:      0,
+              message:        `${fallbackWinner} wins! (payout error — contact admin)`
+            });
+          } catch (e2) {
+            _io.to(`wheel_${wheelId}`).emit('game_over', {
+              wheelId, winnerUserId: null, winnerUsername: 'Unknown', amountWon: 0,
+              message: 'Game over (error — contact admin)'
+            });
+          }
+        }
+      }
     }
 
+  } catch (err) {
+    console.error(`❌ Elimination job error wheel #${wheelId} order #${eliminationOrder}:`, err.message);
+    throw err; // rethrow so Bull retries
   } finally {
     await releaseLock(lockKey);
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// DECLARE WINNER
-// ─────────────────────────────────────────────────────────────
+// ── Declare winner ────────────────────────────────────────────
 async function declareWinner(wheelId) {
   const pool = await getPool();
 
-  // ── Find the last active participant ──────────────────────
   const winnerResult = await pool.request()
     .input('wheel_id', sql.Int, wheelId)
     .query(`
@@ -233,31 +222,30 @@ async function declareWinner(wheelId) {
     `);
 
   const winner = winnerResult.recordset[0];
-  if (!winner) {
-    console.error(`No winner found for wheel #${wheelId}`);
-    return;
-  }
+  if (!winner) throw new Error(`No active participant found to be winner in wheel #${wheelId}`);
 
-  // ── Atomic payout ─────────────────────────────────────────
+  console.log(`🏆 Winner found: ${winner.username} for wheel #${wheelId}, paying out ${winner.winner_pool} coins`);
+
+  // Atomic payout stored procedure
   await pool.request()
     .input('spin_wheel_id',  sql.Int, wheelId)
     .input('winner_user_id', sql.Int, winner.user_id)
     .input('admin_user_id',  sql.Int, winner.created_by)
     .execute('sp_payout_winner');
 
-  // ── Insert into winners table ──────────────────────────────
+  // Insert into winners table
   await pool.request()
-    .input('spin_wheel_id', sql.Int,          wheelId)
-    .input('user_id',       sql.Int,          winner.user_id)
-    .input('winning_amount',sql.Decimal(18,2), parseFloat(winner.winner_pool))
+    .input('spin_wheel_id',  sql.Int,           wheelId)
+    .input('user_id',        sql.Int,           winner.user_id)
+    .input('winning_amount', sql.Decimal(18,2), parseFloat(winner.winner_pool))
     .query(`
       INSERT INTO winners (spin_wheel_id, user_id, winning_amount)
       VALUES (@spin_wheel_id, @user_id, @winning_amount)
     `);
 
-  console.log(`🏆 Winner: ${winner.username} won ${winner.winner_pool} coins from wheel #${wheelId}`);
+  console.log(`✅ Payout complete: ${winner.username} received ${winner.winner_pool} coins`);
 
-  // ── Emit game over event ───────────────────────────────────
+  // Emit game_over to all clients
   if (_io) {
     _io.to(`wheel_${wheelId}`).emit('game_over', {
       wheelId,
@@ -266,18 +254,13 @@ async function declareWinner(wheelId) {
       amountWon:      parseFloat(winner.winner_pool),
       message:        `🏆 ${winner.username} wins ${winner.winner_pool} coins!`
     });
+    console.log(`📡 game_over emitted to room wheel_${wheelId}`);
+  } else {
+    console.error(`❌ _io is null — game_over NOT emitted for wheel #${wheelId}!`);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// ERROR HANDLERS for queues
-// ─────────────────────────────────────────────────────────────
 autoStartQueue.on('failed',   (job, err) => console.error(`Auto-start job failed:`, err.message));
 eliminationQueue.on('failed', (job, err) => console.error(`Elimination job failed [wheel #${job.data.wheelId}]:`, err.message));
 
-module.exports = {
-  setIo,
-  scheduleAutoStart,
-  cancelAutoStart,
-  startElimination
-};
+module.exports = { setIo, scheduleAutoStart, cancelAutoStart, startElimination };
