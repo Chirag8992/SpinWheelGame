@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { adminApi } from '../api/admin.api';
+import { publicApi } from '../api/public.api';
 import { formatCoins } from '../utils/helpers';
 import { useAuth } from '../context/AuthContext';
 
@@ -12,7 +12,7 @@ export default function LeaderboardPage() {
   const [loading,  setLoading] = useState(true);
 
   useEffect(() => {
-    adminApi.getAnalytics(30)
+    publicApi.getLeaderboard(30)
       .then(r => setData(r.data.data))
       .catch(() => {})
       .finally(() => setLoading(false));

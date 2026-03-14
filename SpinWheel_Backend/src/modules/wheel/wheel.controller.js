@@ -31,7 +31,8 @@ async function createWheel(req, res) {
       entryFee:     parsedFee,
       autoStartAt:  result.wheel.auto_start_at,
       config:       result.config,
-      createdBy:    req.user.username
+      createdBy:    req.user.username,
+      settings:     result.settings
     });
 
     return res.status(201).json({
@@ -112,7 +113,11 @@ async function startWheel(req, res) {
     const result = await wheelService.startWheel(req.user.id, parseInt(wheelId));
 
     // ── Start elimination job ──────────────────────────────
-    await eliminationJob.startElimination(parseInt(wheelId), result.eliminationSequence);
+    await eliminationJob.startElimination(
+      parseInt(wheelId),
+      result.eliminationSequence,
+      result.eliminationIntervalSeconds
+    );
 
     // ── Notify all players in the room ────────────────────
     const io = req.app.get('io');

@@ -15,6 +15,27 @@ const eliminationQueue = new Bull('elimination-queue', redisOpts);
 let _io = null;
 function setIo(io) { _io = io; }
 
+let _winnersAmountCol = null;
+async function getWinnersAmountColumn(pool) {
+  if (_winnersAmountCol !== null) return _winnersAmountCol;
+
+  const result = await pool.request().query(`
+    SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'winners'
+  `);
+  const cols = new Set(result.recordset.map(r => String(r.COLUMN_NAME).toLowerCase()));
+  const candidates = [
+    'winning_amount',
+    'amount_won',
+    'amount',
+    'winning_coins',
+    'prize_amount'
+  ];
+  _winnersAmountCol = candidates.find(c => cols.has(c)) || null;
+  return _winnersAmountCol;
+}
+
 // ── Schedule auto-start ───────────────────────────────────────
 async function scheduleAutoStart(wheelId, autoStartAt) {
   const delay = new Date(autoStartAt).getTime() - Date.now();
@@ -33,8 +54,9 @@ async function cancelAutoStart(wheelId) {
 }
 
 // ── Queue elimination jobs ────────────────────────────────────
-async function startElimination(wheelId, eliminationSequence) {
-  const INTERVAL_MS = 7000;
+async function startElimination(wheelId, eliminationSequence, intervalSeconds = 7) {
+  const safeSeconds = Math.max(1, parseInt(intervalSeconds, 10) || 7);
+  const INTERVAL_MS = safeSeconds * 1000;
   for (let i = 0; i < eliminationSequence.length; i++) {
     await eliminationQueue.add(
       {
@@ -62,10 +84,11 @@ autoStartQueue.process(async (job) => {
   try {
     const result = await wheelService.autoStartOrAbort(wheelId);
     if (result.action === 'aborted') {
+      const minParticipants = result.minParticipants || 3;
       console.log(`❌ Wheel #${wheelId} aborted — only ${result.participantCount} players`);
       if (_io) _io.to(`wheel_${wheelId}`).emit('game_aborted', {
         wheelId,
-        message: `Not enough players (${result.participantCount}/3). Entry fees refunded.`
+        message: `Not enough players (${result.participantCount}/${minParticipants}). Entry fees refunded.`
       });
     }
     if (result.action === 'started') {
@@ -75,7 +98,7 @@ autoStartQueue.process(async (job) => {
         participantCount: result.participantCount,
         message: 'Wheel auto-started! Eliminations begin now.'
       });
-      await startElimination(wheelId, result.eliminationSequence);
+      await startElimination(wheelId, result.eliminationSequence, result.eliminationIntervalSeconds);
     }
   } catch (err) {
     console.error(`Auto-start error for wheel #${wheelId}:`, err.message);
@@ -233,15 +256,21 @@ async function declareWinner(wheelId) {
     .input('admin_user_id',  sql.Int, winner.created_by)
     .execute('sp_payout_winner');
 
-  // Insert into winners table
-  await pool.request()
-    .input('spin_wheel_id',  sql.Int,           wheelId)
-    .input('user_id',        sql.Int,           winner.user_id)
-    .input('winning_amount', sql.Decimal(18,2), parseFloat(winner.winner_pool))
-    .query(`
-      INSERT INTO winners (spin_wheel_id, user_id, winning_amount)
+  // Insert into winners table (supports multiple legacy column names)
+  const amountCol = await getWinnersAmountColumn(pool);
+  if (amountCol) {
+    const insertSql = `
+      INSERT INTO winners (spin_wheel_id, user_id, ${amountCol})
       VALUES (@spin_wheel_id, @user_id, @winning_amount)
-    `);
+    `;
+    await pool.request()
+      .input('spin_wheel_id',  sql.Int,           wheelId)
+      .input('user_id',        sql.Int,           winner.user_id)
+      .input('winning_amount', sql.Decimal(18,2), parseFloat(winner.winner_pool))
+      .query(insertSql);
+  } else {
+    console.warn('Winners table has no known amount column; skipping winners insert');
+  }
 
   console.log(`✅ Payout complete: ${winner.username} received ${winner.winner_pool} coins`);
 

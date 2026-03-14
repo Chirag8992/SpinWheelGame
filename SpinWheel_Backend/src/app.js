@@ -37,6 +37,7 @@ app.use('/api/auth',  require('./modules/auth/auth.routes'));
 app.use('/api/coins', require('./modules/coins/coins.routes'));
 app.use('/api/wheel', require('./modules/wheel/wheel.routes'));
 app.use('/api/admin', require('./modules/admin/admin.routes'));
+app.use('/api/public', require('./modules/public/public.routes'));
 
 // ── Socket.io ────────────────────────────────────────────────
 require('./socket/socket.handler')(io);

@@ -9,13 +9,14 @@ import { useWheel } from '../context/WheelContext';
 import { formatCoins, getCountdown } from '../utils/helpers';
 
 
-function CountdownTimer({ autoStartAt }) {
+function CountdownTimer({ autoStartAt, durationSeconds = 180 }) {
   const [cd, setCd] = useState(getCountdown(autoStartAt));
   useEffect(() => {
     const t = setInterval(() => setCd(getCountdown(autoStartAt)), 1000);
     return () => clearInterval(t);
   }, [autoStartAt]);
-  const pct = Math.max(0, (cd.total / (3 * 60 * 1000)) * 100);
+  const totalMs = Math.max(durationSeconds * 1000, 1);
+  const pct = Math.max(0, (cd.total / totalMs) * 100);
   return (
     <div style={{ textAlign: 'center' }}>
       <p style={{ fontFamily: 'var(--font-display)', fontSize: '0.6rem', letterSpacing: '0.15em', color: 'var(--text-muted)', marginBottom: '0.75rem', textTransform: 'uppercase' }}>Auto-starts in</p>
@@ -89,13 +90,14 @@ export default function LobbyPage() {
 // if (!user) return <Navigate to="/login" />;
 
   const { user, isAdmin } = useAuth();
-  const { activeWheel, participants, gameStatus, fetchActive } = useWheel();
+  const { activeWheel, participants, gameStatus, fetchActive, settings } = useWheel();
   const navigate = useNavigate();
   const [balance, setBalance] = useState(null);
   const [joining, setJoining] = useState(false);
   const [starting, setStarting] = useState(false);
   const [aborting, setAborting] = useState(false);
   const hasJoined = participants.some(p => p.username === user?.username);
+  const minParticipants = settings?.min_participants || 3;
 
   useEffect(() => {
     coinsApi.getBalance().then(r => setBalance(r.data.data.coinBalance)).catch(() => {});
@@ -185,12 +187,17 @@ export default function LobbyPage() {
               </div>
 
               {gameStatus === 'waiting' && activeWheel.auto_start_at && (
-                <div style={{ marginBottom:'2rem' }}><CountdownTimer autoStartAt={activeWheel.auto_start_at} /></div>
+                <div style={{ marginBottom:'2rem' }}>
+                  <CountdownTimer
+                    autoStartAt={activeWheel.auto_start_at}
+                    durationSeconds={settings?.auto_start_seconds || 180}
+                  />
+                </div>
               )}
 
-              {participants.length < 3 && (
+              {participants.length < minParticipants && (
                 <div style={{ marginBottom:'1.5rem', padding:'0.75rem 1rem', background:'rgba(255,45,85,0.08)', border:'1px solid rgba(255,45,85,0.2)', borderRadius:'var(--radius-md)', color:'var(--red)', fontSize:'0.85rem' }}>
-                  ⚠️ Need at least 3 players to start ({3 - participants.length} more needed)
+                  ⚠️ Need at least {minParticipants} players to start ({minParticipants - participants.length} more needed)
                 </div>
               )}
 
@@ -207,7 +214,7 @@ export default function LobbyPage() {
                 )}
                 {isAdmin && gameStatus === 'waiting' && (
                   <>
-                    <button className="btn btn-cyan" onClick={handleStart} disabled={starting || participants.length < 3} style={{ justifyContent:'center' }}>
+                    <button className="btn btn-cyan" onClick={handleStart} disabled={starting || participants.length < minParticipants} style={{ justifyContent:'center' }}>
                       {starting ? <div className="spinner" style={{width:16,height:16,borderWidth:2}} /> : <><Play size={14} /> Start Now</>}
                     </button>
                     <button className="btn btn-red" onClick={handleAbort} disabled={aborting}>

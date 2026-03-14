@@ -152,8 +152,42 @@ async function updateConfig(adminId, winnerPercent, adminPercent, appPercent) {
 // ─────────────────────────────────────────────────────────────
 // SYSTEM SETTINGS
 // ─────────────────────────────────────────────────────────────
+async function ensureSystemSettingsTable(pool) {
+  await pool.request().query(`
+    IF OBJECT_ID('system_settings', 'U') IS NULL
+    BEGIN
+      CREATE TABLE system_settings (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        auto_start_seconds           INT NOT NULL,
+        elimination_interval_seconds INT NOT NULL,
+        min_participants             INT NOT NULL,
+        created_by INT NULL,
+        updated_by INT NOT NULL,
+        created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+        updated_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+      );
+    END
+  `);
+}
+
+async function getTableColumns(pool, tableName) {
+  const result = await pool.request()
+    .input('table', sql.NVarChar, tableName)
+    .query(`
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_NAME = @table
+    `);
+  return new Set(result.recordset.map(r => String(r.COLUMN_NAME).toLowerCase()));
+}
+
+async function getSystemSettingsColumns(pool) {
+  return getTableColumns(pool, 'system_settings');
+}
+
 async function getSettings() {
   const pool = await getPool();
+  await ensureSystemSettingsTable(pool);
 
   const result = await pool.request().query(`
     SELECT TOP 1 * FROM system_settings ORDER BY id DESC
@@ -169,6 +203,8 @@ async function getSettings() {
 
 async function updateSettings(adminId, settings) {
   const pool = await getPool();
+  await ensureSystemSettingsTable(pool);
+  const columns = await getSystemSettingsColumns(pool);
 
   const {
     auto_start_seconds           = 180,
@@ -176,39 +212,101 @@ async function updateSettings(adminId, settings) {
     min_participants             = 3
   } = settings;
 
+  const parsedAutoStart = parseInt(auto_start_seconds, 10);
+  const parsedElimInt   = parseInt(elimination_interval_seconds, 10);
+  const parsedMinParts  = parseInt(min_participants, 10);
+
+  if (!Number.isFinite(parsedAutoStart)) throw new Error('auto_start_seconds must be a number');
+  if (!Number.isFinite(parsedElimInt))   throw new Error('elimination_interval_seconds must be a number');
+  if (!Number.isFinite(parsedMinParts))  throw new Error('min_participants must be a number');
+
   // Validate
-  if (auto_start_seconds < 30)            throw new Error('auto_start_seconds must be >= 30');
-  if (elimination_interval_seconds < 3)   throw new Error('elimination_interval_seconds must be >= 3');
-  if (min_participants < 2)               throw new Error('min_participants must be >= 2');
+  if (parsedAutoStart < 30)            throw new Error('auto_start_seconds must be >= 30');
+  if (parsedElimInt < 3)               throw new Error('elimination_interval_seconds must be >= 3');
+  if (parsedMinParts < 2)              throw new Error('min_participants must be >= 2');
 
   // Check if settings row exists
-  const existing = await pool.request().query(`SELECT TOP 1 id FROM system_settings`);
+  const existing = await pool.request().query(`SELECT TOP 1 id FROM system_settings ORDER BY id DESC`);
 
   if (existing.recordset.length > 0) {
-    await pool.request()
-      .input('auto_start_seconds',           sql.Int, auto_start_seconds)
-      .input('elimination_interval_seconds', sql.Int, elimination_interval_seconds)
-      .input('min_participants',             sql.Int, min_participants)
-      .query(`
+    const rowId = existing.recordset[0].id;
+    let updateSql = `
         UPDATE system_settings
         SET auto_start_seconds           = @auto_start_seconds,
             elimination_interval_seconds = @elimination_interval_seconds,
             min_participants             = @min_participants
-      `);
+    `;
+    if (columns.has('updated_by')) {
+      updateSql += `, updated_by = @updated_by`;
+    }
+    if (columns.has('updated_at')) {
+      updateSql += `, updated_at = SYSUTCDATETIME()`;
+    }
+    updateSql += ` WHERE id = @id`;
+
+    const req = pool.request()
+      .input('id',                           sql.Int, rowId)
+      .input('auto_start_seconds',           sql.Int, parsedAutoStart)
+      .input('elimination_interval_seconds', sql.Int, parsedElimInt)
+      .input('min_participants',             sql.Int, parsedMinParts);
+
+    if (columns.has('updated_by')) {
+      req.input('updated_by', sql.Int, adminId);
+    }
+
+    await req.query(updateSql);
   } else {
-    await pool.request()
-      .input('auto_start_seconds',           sql.Int, auto_start_seconds)
-      .input('elimination_interval_seconds', sql.Int, elimination_interval_seconds)
-      .input('min_participants',             sql.Int, min_participants)
-      .query(`
+    const insertCols = [
+      'auto_start_seconds',
+      'elimination_interval_seconds',
+      'min_participants'
+    ];
+    const insertVals = [
+      '@auto_start_seconds',
+      '@elimination_interval_seconds',
+      '@min_participants'
+    ];
+
+    if (columns.has('created_by')) {
+      insertCols.push('created_by');
+      insertVals.push('@created_by');
+    }
+    if (columns.has('updated_by')) {
+      insertCols.push('updated_by');
+      insertVals.push('@updated_by');
+    }
+    if (columns.has('updated_at')) {
+      insertCols.push('updated_at');
+      insertVals.push('SYSUTCDATETIME()');
+    }
+
+    const insertSql = `
         INSERT INTO system_settings
-          (auto_start_seconds, elimination_interval_seconds, min_participants)
+          (${insertCols.join(', ')})
         VALUES
-          (@auto_start_seconds, @elimination_interval_seconds, @min_participants)
-      `);
+          (${insertVals.join(', ')})
+      `;
+
+    const req = pool.request()
+      .input('auto_start_seconds',           sql.Int, parsedAutoStart)
+      .input('elimination_interval_seconds', sql.Int, parsedElimInt)
+      .input('min_participants',             sql.Int, parsedMinParts);
+
+    if (columns.has('created_by')) {
+      req.input('created_by', sql.Int, adminId);
+    }
+    if (columns.has('updated_by')) {
+      req.input('updated_by', sql.Int, adminId);
+    }
+
+    await req.query(insertSql);
   }
 
-  return { auto_start_seconds, elimination_interval_seconds, min_participants };
+  return {
+    auto_start_seconds:           parsedAutoStart,
+    elimination_interval_seconds: parsedElimInt,
+    min_participants:             parsedMinParts
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -277,6 +375,18 @@ async function toggleUserStatus(adminId, targetUserId) {
 async function getAnalytics(days = 7) {
   const pool = await getPool();
 
+  const topWinnersQuery = `
+    SELECT TOP 10
+      u.username,
+      COUNT(*)      AS total_wins,
+      SUM(t.amount) AS total_won
+    FROM transactions t
+    INNER JOIN users u ON u.id = t.user_id
+    WHERE t.type = 'winner_pool_credit'
+    GROUP BY u.id, u.username
+    ORDER BY total_won DESC
+  `;
+
   const [dailyWheels, topWinners, recentTransactions] = await Promise.all([
 
     // Wheels per day (last N days)
@@ -296,16 +406,7 @@ async function getAnalytics(days = 7) {
       `),
 
     // Top 10 winners all time
-    pool.request().query(`
-      SELECT TOP 10
-        u.username,
-        COUNT(w.id)    AS total_wins,
-        SUM(w.winning_amount) AS total_won
-      FROM winners w
-      INNER JOIN users u ON u.id = w.user_id
-      GROUP BY u.id, u.username
-      ORDER BY total_won DESC
-    `),
+    pool.request().query(topWinnersQuery),
 
     // Last 20 transactions across all users
     pool.request().query(`

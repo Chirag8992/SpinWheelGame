@@ -15,6 +15,11 @@ export function WheelProvider({ children }) {
   const [winner,       setWinner]       = useState(null);
   const [gameStatus,   setGameStatus]   = useState('idle');
   const [loading,      setLoading]      = useState(false);
+  const [settings,     setSettings]     = useState({
+    auto_start_seconds: 180,
+    elimination_interval_seconds: 7,
+    min_participants: 3
+  });
 
   // ── Fetch active wheel on mount ───────────────────────────
   const fetchActive = useCallback(async () => {
@@ -27,12 +32,22 @@ export function WheelProvider({ children }) {
         setGameStatus(res.data.data.wheel.status);
         setEliminations([]);
         setWinner(null);
+        setSettings(res.data.data.settings || {
+          auto_start_seconds: 180,
+          elimination_interval_seconds: 7,
+          min_participants: 3
+        });
       } else {
         setActiveWheel(null);
         setParticipants([]);
         setGameStatus('idle');
         setEliminations([]);
         setWinner(null);
+        setSettings({
+          auto_start_seconds: 180,
+          elimination_interval_seconds: 7,
+          min_participants: 3
+        });
       }
     } catch { /* silent */ }
     finally { setLoading(false); }
@@ -119,6 +134,9 @@ export function WheelProvider({ children }) {
             : p
         )
       );
+
+      // Refresh active wheel state (finished wheels should disappear from lobby)
+      setTimeout(() => { fetchActive(); }, 800);
     });
 
     // Game aborted
@@ -166,7 +184,7 @@ export function WheelProvider({ children }) {
   return (
     <WheelContext.Provider value={{
       activeWheel, participants, eliminations,
-      winner, gameStatus, loading,
+      winner, gameStatus, loading, settings,
       fetchActive, resetWheel
     }}>
       {children}

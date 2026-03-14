@@ -1,6 +1,37 @@
 const { getPool, sql } = require('../../config/db');
 const { acquireLock, releaseLock } = require('../../config/redis');
 
+const DEFAULT_SETTINGS = {
+  auto_start_seconds: 180,
+  elimination_interval_seconds: 7,
+  min_participants: 3
+};
+
+async function getSystemSettings(pool) {
+  try {
+    const result = await pool.request().query(`
+      SELECT TOP 1
+        auto_start_seconds,
+        elimination_interval_seconds,
+        min_participants
+      FROM system_settings
+      ORDER BY id DESC
+    `);
+    const row = result.recordset[0];
+    if (!row) return DEFAULT_SETTINGS;
+    return {
+      auto_start_seconds:           parseInt(row.auto_start_seconds, 10) || DEFAULT_SETTINGS.auto_start_seconds,
+      elimination_interval_seconds: parseInt(row.elimination_interval_seconds, 10) || DEFAULT_SETTINGS.elimination_interval_seconds,
+      min_participants:             parseInt(row.min_participants, 10) || DEFAULT_SETTINGS.min_participants
+    };
+  } catch (err) {
+    if (err.message && err.message.includes('system_settings')) {
+      return DEFAULT_SETTINGS;
+    }
+    throw err;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
@@ -39,6 +70,8 @@ async function getActiveWheel(pool) {
 // ─────────────────────────────────────────────────────────────
 async function createWheel(adminId, entryFee) {
   const pool = await getPool();
+  const settings = await getSystemSettings(pool);
+  // const settings = await getSystemSettings(pool);
 
   if (!entryFee || entryFee <= 0) throw new Error('Entry fee must be greater than 0');
 
@@ -51,8 +84,8 @@ async function createWheel(adminId, entryFee) {
   // ── Get active config ──────────────────────────────────────
   const config = await getActiveConfig(pool);
 
-  // ── auto_start_at = now + 3 minutes ───────────────────────
-  const autoStartAt = new Date(Date.now() + 3 * 60 * 1000);
+  // ── auto_start_at = now + configured seconds ──────────────
+  const autoStartAt = new Date(Date.now() + settings.auto_start_seconds * 1000);
 
   const result = await pool.request()
     .input('created_by',   sql.Int,          adminId)
@@ -76,7 +109,8 @@ async function createWheel(adminId, entryFee) {
       winnerPercent: config.winner_percent,
       adminPercent:  config.admin_percent,
       appPercent:    config.app_percent
-    }
+    },
+    settings
   };
 }
 
@@ -145,6 +179,7 @@ async function joinWheel(userId, wheelId) {
 // ─────────────────────────────────────────────────────────────
 async function startWheel(adminId, wheelId) {
   const pool = await getPool();
+  const settings = await getSystemSettings(pool);
 
   // ── 1. Get wheel ───────────────────────────────────────────
   const wheelResult = await pool.request()
@@ -165,8 +200,8 @@ async function startWheel(adminId, wheelId) {
     `);
 
   const participantCount = countResult.recordset[0].total;
-  if (participantCount < 3) {
-    throw new Error(`Need at least 3 participants to start. Currently have ${participantCount}.`);
+  if (participantCount < settings.min_participants) {
+    throw new Error(`Need at least ${settings.min_participants} participants to start. Currently have ${participantCount}.`);
   }
 
   // ── 3. Generate random elimination sequence ────────────────
@@ -197,7 +232,9 @@ async function startWheel(adminId, wheelId) {
     wheelId,
     participantCount,
     eliminationSequence, // returned so job can use it
-    message: 'Wheel started successfully'
+    message: 'Wheel started successfully',
+    eliminationIntervalSeconds: settings.elimination_interval_seconds,
+    minParticipants: settings.min_participants
   };
 }
 
@@ -224,13 +261,13 @@ async function autoStartOrAbort(wheelId) {
 
   const count = countResult.recordset[0].total;
 
-  if (count < 3) {
+  if (count < settings.min_participants) {
     // ── Not enough players → abort and refund ─────────────
     await pool.request()
       .input('spin_wheel_id', sql.Int, wheelId)
       .execute('sp_abort_and_refund');
 
-    return { action: 'aborted', participantCount: count };
+    return { action: 'aborted', participantCount: count, minParticipants: settings.min_participants };
   } else {
     // ── Enough players → start automatically ──────────────
     const result = await startWheel(null, wheelId);
@@ -292,7 +329,8 @@ async function getActiveWheelWithParticipants() {
   if (!wheel) return null;
 
   const participants = await getParticipants(wheel.id);
-  return { wheel, participants };
+  const settings = await getSystemSettings(pool);
+  return { wheel, participants, settings };
 }
 
 async function getParticipants(wheelId) {

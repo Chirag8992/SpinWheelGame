@@ -82,7 +82,11 @@ async function getSettings(req, res) {
     return res.status(200).json({ success: true, data: settings });
   } catch (err) {
     console.error('Get settings error:', err.message);
-    return res.status(500).json({ success: false, message: 'Failed to get settings' });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to get settings',
+      ...(process.env.NODE_ENV === 'development' && { error: err.message })
+    });
   }
 }
 
@@ -106,7 +110,11 @@ async function updateSettings(req, res) {
       return res.status(400).json({ success: false, message: err.message });
     }
     console.error('Update settings error:', err.message);
-    return res.status(500).json({ success: false, message: 'Failed to update settings' });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update settings',
+      ...(process.env.NODE_ENV === 'development' && { error: err.message })
+    });
   }
 }
 
