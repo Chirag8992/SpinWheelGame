@@ -1,9 +1,9 @@
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import Navbar from './components/common/Navbar';
+import { AdminRoute, ProtectedRoute } from './components/common/ProtectedRoute';
 import { AuthProvider } from './context/AuthContext';
 import { WheelProvider } from './context/WheelContext';
-import { ProtectedRoute, AdminRoute } from './components/common/ProtectedRoute';
-import Navbar from './components/common/Navbar';
 import './styles/globals.css';
 
 // Pages — lazy loaded for performance

@@ -226,6 +226,54 @@ export default function GamePage() {
 
     sock.on('connect_error', e => console.warn('[GAME] connect error:', e.message));
 
+    // ── game_state_sync — RECONNECT RESYNC ────────────────
+    // Server sends this immediately on join_room with the full
+    // current snapshot. Handles page refresh mid-game perfectly.
+    sock.on('game_state_sync', (data) => {
+      console.log('[GAME] game_state_sync received:', data.wheel?.status, data.participants?.length, 'players');
+
+      const { wheel, participants, eliminations, winner: syncWinner } = data;
+
+      // Rebuild player list from server snapshot
+      if (participants && participants.length > 0) {
+        setPlayers(participants.map(p => ({
+          username:       p.username,
+          status:         p.status === 'winner' ? 'winner'
+                        : p.status === 'eliminated' ? 'eliminated'
+                        : 'active',
+          entry_fee_paid: p.entry_fee_paid,
+        })));
+      }
+
+      // Rebuild elimination feed (already newest-first from server)
+      if (eliminations && eliminations.length > 0) {
+        setFeedItems(eliminations);
+      }
+
+      // Update wheel info
+      if (wheel) {
+        setWheelInfo(wheel);
+      }
+
+      // If game already finished, show result immediately
+      if (wheel?.status === 'finished' && syncWinner) {
+        gameOverRef.current = true;
+        setGameOver(true);
+        if (cdRef.current) { clearInterval(cdRef.current); cdRef.current = null; }
+        setCountdown(0);
+        setWinner({ winnerUsername: syncWinner.winnerUsername, amountWon: syncWinner.amountWon });
+        setTimeout(() => setShowModal(true), 500);
+      }
+
+      // If game is active, ensure countdown is running
+      if (wheel?.status === 'active' && !gameOverRef.current) {
+        if (!cdRef.current) {
+          setCountdown(7);
+          cdRef.current = setInterval(() => setCountdown(c => c <= 1 ? 7 : c - 1), 1000);
+        }
+      }
+    });
+
     // ── player_eliminated ──────────────────────────────
     sock.on('player_eliminated', (data) => {
       console.log('[GAME] player_eliminated:', data);
@@ -305,6 +353,7 @@ export default function GamePage() {
     // Cleanup on unmount
     return () => {
       console.log('[GAME] cleaning up socket');
+      sock.off('game_state_sync');
       sock.removeAllListeners();
       sock.disconnect();
       if (cdRef.current) clearInterval(cdRef.current);
