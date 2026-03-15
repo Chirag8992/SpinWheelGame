@@ -2,9 +2,9 @@ const { getPool, sql } = require('../../config/db');
 const { acquireLock, releaseLock } = require('../../config/redis');
 
 const DEFAULT_SETTINGS = {
-  auto_start_seconds: 180,
+  auto_start_seconds:           180,
   elimination_interval_seconds: 7,
-  min_participants: 3
+  min_participants:             3
 };
 
 async function getSystemSettings(pool) {
@@ -20,14 +20,12 @@ async function getSystemSettings(pool) {
     const row = result.recordset[0];
     if (!row) return DEFAULT_SETTINGS;
     return {
-      auto_start_seconds:           parseInt(row.auto_start_seconds, 10) || DEFAULT_SETTINGS.auto_start_seconds,
+      auto_start_seconds:           parseInt(row.auto_start_seconds, 10)           || DEFAULT_SETTINGS.auto_start_seconds,
       elimination_interval_seconds: parseInt(row.elimination_interval_seconds, 10) || DEFAULT_SETTINGS.elimination_interval_seconds,
-      min_participants:             parseInt(row.min_participants, 10) || DEFAULT_SETTINGS.min_participants
+      min_participants:             parseInt(row.min_participants, 10)             || DEFAULT_SETTINGS.min_participants
     };
   } catch (err) {
-    if (err.message && err.message.includes('system_settings')) {
-      return DEFAULT_SETTINGS;
-    }
+    if (err.message && err.message.includes('system_settings')) return DEFAULT_SETTINGS;
     throw err;
   }
 }
@@ -35,10 +33,6 @@ async function getSystemSettings(pool) {
 // ─────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────
-
-/**
- * Get the active coin distribution config from DB
- */
 async function getActiveConfig(pool) {
   const result = await pool.request().query(`
     SELECT TOP 1 id, winner_percent, admin_percent, app_percent
@@ -50,9 +44,6 @@ async function getActiveConfig(pool) {
   return result.recordset[0];
 }
 
-/**
- * Get active or waiting wheel (there can only be one)
- */
 async function getActiveWheel(pool) {
   const result = await pool.request().query(`
     SELECT TOP 1
@@ -69,29 +60,25 @@ async function getActiveWheel(pool) {
 // 1. CREATE WHEEL  (admin only)
 // ─────────────────────────────────────────────────────────────
 async function createWheel(adminId, entryFee) {
-  const pool = await getPool();
+  const pool     = await getPool();
   const settings = await getSystemSettings(pool);
-  // const settings = await getSystemSettings(pool);
 
   if (!entryFee || entryFee <= 0) throw new Error('Entry fee must be greater than 0');
 
-  // ── Check no active wheel already exists ───────────────────
+  // App-level check (DB filtered unique index is the hard enforcement)
   const existing = await getActiveWheel(pool);
   if (existing) {
     throw new Error(`A wheel is already ${existing.status}. Only one active wheel allowed at a time.`);
   }
 
-  // ── Get active config ──────────────────────────────────────
-  const config = await getActiveConfig(pool);
-
-  // ── auto_start_at = now + configured seconds ──────────────
+  const config      = await getActiveConfig(pool);
   const autoStartAt = new Date(Date.now() + settings.auto_start_seconds * 1000);
 
   const result = await pool.request()
-    .input('created_by',   sql.Int,          adminId)
-    .input('entry_fee',    sql.Decimal(18,2), entryFee)
-    .input('config_id',    sql.Int,          config.id)
-    .input('auto_start_at',sql.DateTime2,    autoStartAt)
+    .input('created_by',    sql.Int,           adminId)
+    .input('entry_fee',     sql.Decimal(18,2),  entryFee)
+    .input('config_id',     sql.Int,            config.id)
+    .input('auto_start_at', sql.DateTime2,      autoStartAt)
     .query(`
       INSERT INTO spin_wheels
         (created_by, entry_fee, status, config_id, auto_start_at)
@@ -120,13 +107,12 @@ async function createWheel(adminId, entryFee) {
 async function joinWheel(userId, wheelId) {
   const pool = await getPool();
 
-  // ── Distributed lock: prevent concurrent joins causing race conditions ──
+  // Distributed lock: prevent concurrent joins race condition
   const lockKey = `lock:join:wheel:${wheelId}:user:${userId}`;
   const locked  = await acquireLock(lockKey, 5000);
   if (!locked) throw new Error('Request in progress, please try again');
 
   try {
-    // ── 1. Verify wheel exists and is waiting ──────────────
     const wheelResult = await pool.request()
       .input('id', sql.Int, wheelId)
       .query(`
@@ -137,112 +123,124 @@ async function joinWheel(userId, wheelId) {
       `);
 
     const wheel = wheelResult.recordset[0];
-    if (!wheel)                    throw new Error('Wheel not found');
+    if (!wheel)                     throw new Error('Wheel not found');
     if (wheel.status !== 'waiting') throw new Error(`Cannot join. Wheel is ${wheel.status}`);
 
-    // ── 2. Check user not already in this wheel ────────────
     const alreadyJoined = await pool.request()
       .input('wheel_id', sql.Int, wheelId)
       .input('user_id',  sql.Int, userId)
-      .query(`
-        SELECT id FROM spin_wheel_participants
-        WHERE spin_wheel_id = @wheel_id AND user_id = @user_id
-      `);
+      .query(`SELECT id FROM spin_wheel_participants WHERE spin_wheel_id = @wheel_id AND user_id = @user_id`);
 
-    if (alreadyJoined.recordset.length > 0) {
-      throw new Error('You have already joined this wheel');
-    }
+    if (alreadyJoined.recordset.length > 0) throw new Error('You have already joined this wheel');
 
-    // ── 3. Call atomic stored procedure ───────────────────
     await pool.request()
-      .input('spin_wheel_id', sql.Int,          wheelId)
-      .input('user_id',       sql.Int,          userId)
-      .input('entry_fee',     sql.Decimal(18,2), parseFloat(wheel.entry_fee))
-      .input('winner_pct',    sql.Decimal(5,2),  parseFloat(wheel.winner_percent))
-      .input('admin_pct',     sql.Decimal(5,2),  parseFloat(wheel.admin_percent))
-      .input('app_pct',       sql.Decimal(5,2),  parseFloat(wheel.app_percent))
+      .input('spin_wheel_id', sql.Int,           wheelId)
+      .input('user_id',       sql.Int,           userId)
+      .input('entry_fee',     sql.Decimal(18,2),  parseFloat(wheel.entry_fee))
+      .input('winner_pct',    sql.Decimal(5,2),   parseFloat(wheel.winner_percent))
+      .input('admin_pct',     sql.Decimal(5,2),   parseFloat(wheel.admin_percent))
+      .input('app_pct',       sql.Decimal(5,2),   parseFloat(wheel.app_percent))
       .execute('sp_join_spin_wheel');
 
-    // ── 4. Get updated wheel state to return ──────────────
     const updatedWheel = await getWheelById(wheelId);
     const participants = await getParticipants(wheelId);
-
     return { wheel: updatedWheel, participants };
 
   } finally {
-    await releaseLock(lockKey); // always release lock
+    await releaseLock(lockKey);
   }
 }
 
 // ─────────────────────────────────────────────────────────────
 // 3. START WHEEL  (admin manual start)
+// FIX: Wrapped in Redis lock to prevent race with auto-start Bull job.
+// If admin clicks Start at the exact moment the 3-min job fires,
+// only ONE of them will acquire the lock and proceed.
 // ─────────────────────────────────────────────────────────────
 async function startWheel(adminId, wheelId) {
   const pool = await getPool();
-  const settings = await getSystemSettings(pool);
 
-  // ── 1. Get wheel ───────────────────────────────────────────
-  const wheelResult = await pool.request()
-    .input('id', sql.Int, wheelId)
-    .query(`SELECT * FROM spin_wheels WHERE id = @id`);
-
-  const wheel = wheelResult.recordset[0];
-  if (!wheel)                     throw new Error('Wheel not found');
-  if (wheel.status !== 'waiting') throw new Error(`Cannot start. Wheel is already ${wheel.status}`);
-
-  // ── 2. Check min participants ──────────────────────────────
-  const countResult = await pool.request()
-    .input('wheel_id', sql.Int, wheelId)
-    .query(`
-      SELECT COUNT(*) AS total
-      FROM spin_wheel_participants
-      WHERE spin_wheel_id = @wheel_id AND status = 'active'
-    `);
-
-  const participantCount = countResult.recordset[0].total;
-  if (participantCount < settings.min_participants) {
-    throw new Error(`Need at least ${settings.min_participants} participants to start. Currently have ${participantCount}.`);
+  // ── RACE CONDITION FIX: distributed lock on start ─────────
+  const startLockKey = `lock:start:wheel:${wheelId}`;
+  const locked       = await acquireLock(startLockKey, 15000);
+  if (!locked) {
+    throw new Error('Wheel start already in progress. Please wait.');
   }
 
-  // ── 3. Generate random elimination sequence ────────────────
-  const participantsResult = await pool.request()
-    .input('wheel_id', sql.Int, wheelId)
-    .query(`
-      SELECT user_id FROM spin_wheel_participants
-      WHERE spin_wheel_id = @wheel_id AND status = 'active'
-    `);
+  try {
+    const settings = await getSystemSettings(pool);
 
-  const userIds = participantsResult.recordset.map(r => r.user_id);
-  const eliminationSequence = shuffle(userIds);   // random order
-  // Last one in sequence = winner (never eliminated)
-  eliminationSequence.pop();
+    const wheelResult = await pool.request()
+      .input('id', sql.Int, wheelId)
+      .query(`SELECT * FROM spin_wheels WHERE id = @id`);
 
-  // ── 4. Update wheel status to active ──────────────────────
-  await pool.request()
-    .input('id', sql.Int, wheelId)
-    .query(`
-      UPDATE spin_wheels
-      SET status     = 'active',
-          started_at = GETUTCDATE(),
-          updated_at = GETUTCDATE()
-      WHERE id = @id
-    `);
+    const wheel = wheelResult.recordset[0];
+    if (!wheel) throw new Error('Wheel not found');
 
-  return {
-    wheelId,
-    participantCount,
-    eliminationSequence, // returned so job can use it
-    message: 'Wheel started successfully',
-    eliminationIntervalSeconds: settings.elimination_interval_seconds,
-    minParticipants: settings.min_participants
-  };
+    // This check is now inside the lock — safe from race
+    if (wheel.status !== 'waiting') {
+      throw new Error(`Cannot start. Wheel is already ${wheel.status}`);
+    }
+
+    const countResult = await pool.request()
+      .input('wheel_id', sql.Int, wheelId)
+      .query(`
+        SELECT COUNT(*) AS total
+        FROM spin_wheel_participants
+        WHERE spin_wheel_id = @wheel_id AND status = 'active'
+      `);
+
+    const participantCount = countResult.recordset[0].total;
+    if (participantCount < settings.min_participants) {
+      throw new Error(`Need at least ${settings.min_participants} participants to start. Currently have ${participantCount}.`);
+    }
+
+    const participantsResult = await pool.request()
+      .input('wheel_id', sql.Int, wheelId)
+      .query(`SELECT user_id FROM spin_wheel_participants WHERE spin_wheel_id = @wheel_id AND status = 'active'`);
+
+    const userIds             = participantsResult.recordset.map(r => r.user_id);
+    const eliminationSequence = shuffle(userIds);
+    eliminationSequence.pop(); // last = winner, never eliminated
+
+    // Atomic status update with optimistic concurrency check
+    // Only updates if wheel is STILL 'waiting' — extra safety net
+    const updateResult = await pool.request()
+      .input('id', sql.Int, wheelId)
+      .query(`
+        UPDATE spin_wheels
+        SET status     = 'active',
+            started_at = GETUTCDATE(),
+            updated_at = GETUTCDATE()
+        WHERE id = @id AND status = 'waiting'
+      `);
+
+    // If 0 rows updated, another process already started it
+    if (updateResult.rowsAffected[0] === 0) {
+      throw new Error('Wheel was already started by another process');
+    }
+
+    return {
+      wheelId,
+      participantCount,
+      eliminationSequence,
+      message:                    'Wheel started successfully',
+      eliminationIntervalSeconds: settings.elimination_interval_seconds,
+      minParticipants:            settings.min_participants
+    };
+
+  } finally {
+    await releaseLock(startLockKey);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
 // 4. AUTO-START CHECK  (called by Bull job at auto_start_at)
+// Also uses the same start lock — prevents race with manual start
 // ─────────────────────────────────────────────────────────────
 async function autoStartOrAbort(wheelId) {
-  const pool = await getPool();
+  const pool     = await getPool();
+  const settings = await getSystemSettings(pool);
 
   const wheelResult = await pool.request()
     .input('id', sql.Int, wheelId)
@@ -251,7 +249,6 @@ async function autoStartOrAbort(wheelId) {
   const wheel = wheelResult.recordset[0];
   if (!wheel || wheel.status !== 'waiting') return { action: 'skipped' };
 
-  // Count active participants
   const countResult = await pool.request()
     .input('wheel_id', sql.Int, wheelId)
     .query(`
@@ -262,14 +259,12 @@ async function autoStartOrAbort(wheelId) {
   const count = countResult.recordset[0].total;
 
   if (count < settings.min_participants) {
-    // ── Not enough players → abort and refund ─────────────
     await pool.request()
       .input('spin_wheel_id', sql.Int, wheelId)
       .execute('sp_abort_and_refund');
-
     return { action: 'aborted', participantCount: count, minParticipants: settings.min_participants };
   } else {
-    // ── Enough players → start automatically ──────────────
+    // startWheel now has its own lock internally
     const result = await startWheel(null, wheelId);
     return { action: 'started', ...result };
   }
@@ -301,7 +296,6 @@ async function abortWheel(adminId, wheelId) {
 // ─────────────────────────────────────────────────────────────
 async function getWheelById(wheelId) {
   const pool = await getPool();
-
   const result = await pool.request()
     .input('id', sql.Int, wheelId)
     .query(`
@@ -319,7 +313,6 @@ async function getWheelById(wheelId) {
       INNER JOIN coin_distribution_config cdc ON cdc.id = sw.config_id
       WHERE sw.id = @id
     `);
-
   return result.recordset[0] || null;
 }
 
@@ -327,15 +320,13 @@ async function getActiveWheelWithParticipants() {
   const pool  = await getPool();
   const wheel = await getActiveWheel(pool);
   if (!wheel) return null;
-
   const participants = await getParticipants(wheel.id);
-  const settings = await getSystemSettings(pool);
+  const settings     = await getSystemSettings(pool);
   return { wheel, participants, settings };
 }
 
 async function getParticipants(wheelId) {
   const pool = await getPool();
-
   const result = await pool.request()
     .input('wheel_id', sql.Int, wheelId)
     .query(`
@@ -348,14 +339,12 @@ async function getParticipants(wheelId) {
       WHERE p.spin_wheel_id = @wheel_id
       ORDER BY p.joined_at ASC
     `);
-
   return result.recordset;
 }
 
 async function getWheelHistory(page = 1, limit = 10) {
   const pool   = await getPool();
   const offset = (page - 1) * limit;
-
   const result = await pool.request()
     .input('limit',  sql.Int, limit)
     .input('offset', sql.Int, offset)
@@ -372,10 +361,8 @@ async function getWheelHistory(page = 1, limit = 10) {
       ORDER BY sw.created_at DESC
       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
     `);
-
   const countResult = await pool.request()
     .query(`SELECT COUNT(*) AS total FROM spin_wheels`);
-
   return {
     wheels: result.recordset,
     pagination: {
